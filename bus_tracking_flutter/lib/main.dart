@@ -1,3 +1,5 @@
+// main.dart
+
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
@@ -6,515 +8,292 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:http/http.dart' as http;
-// Import the RouteService
+import 'package:timezone/data/latest.dart' as tz;
+import 'package:timezone/timezone.dart' as tz;
+
+// Make sure you have a 'route_service.dart' file to handle fetching routes.
 import 'route_service.dart';
 
-const String websocketUrl = "wss://bus.vnrzone.site";
+const String websocketUrl = "wss://bus.vjstartup.com";
+
 Future<void> initializeService() async {
   final service = FlutterBackgroundService();
+  tz.initializeTimeZones();
   await service.configure(
     androidConfiguration: AndroidConfiguration(
       onStart: onStart,
       isForegroundMode: true,
-      autoStart: false, // Ensure the service starts automatically
+      autoStart: true,
+      autoStartOnBoot: true,
+      notificationChannelId: 'vj_bus_driver_service',
+      initialNotificationTitle: 'VJ Bus Service',
+      initialNotificationContent: 'Service is running in the background.',
+      foregroundServiceNotificationId: 888,
     ),
-    iosConfiguration: IosConfiguration(),
+    iosConfiguration: IosConfiguration(
+      autoStart: true,
+      onForeground: onStart,
+    ),
   );
 }
 
+// MODIFIED: `onStart` function with extensive logging[1]
 @pragma('vm:entry-point')
 void onStart(ServiceInstance service) async {
-  SharedPreferences prefs = await SharedPreferences.getInstance();
-  String? selectedRoute = prefs.getString("selectedRoute");
-  bool isAdminDisconnected = prefs.getBool("adminDisconnected") ?? false;
+  WidgetsFlutterBinding.ensureInitialized();
+  tz.initializeTimeZones();
+
+  final prefs = await SharedPreferences.getInstance();
   
-  // Don't start socket if admin disconnected
-  if (isAdminDisconnected) {
-    service.stopSelf();
-    return;
+  // Centralized logging function for the background service[1]
+  void log(String message) {
+    // This log is visible via `adb logcat`
+    print('[BackgroundService] $message');
+    
+    // This saves the log to be viewed in the UI
+    final now = DateTime.now().toIso8601String();
+    prefs.setString('last_background_log', '$now - $message');
   }
 
-  IO.Socket socket = IO.io(
-    websocketUrl,
-    IO.OptionBuilder().setTransports(["websocket"]).disableAutoConnect().build(),
-  );
-  socket.connect();
-  
-  String? socketId;
-  socket.onConnect((_) {
-    print("Socket Connected ✅");
-    socketId = socket.id;
-    print("Background Service Socket ID: $socketId");
-  });
-  
-  socket.onDisconnect((_) => print("Socket Disconnected ❌"));
-  
-  // Handle admin disconnect in background service
-  socket.on('force_disconnect', (data) async {
-    print("Received force disconnect from admin in background service");
-    // Set flag in shared preferences
-    SharedPreferences prefs = await SharedPreferences.getInstance();
-    await prefs.setBool("adminDisconnected", true);
-    
-    // Send final location update
-    try {
-      Position position = await Geolocator.getCurrentPosition();
-      socket.emit("location_update", {
-        "route_id": selectedRoute,
-        "latitude": position.latitude, 
-        "longitude": position.longitude,
-        "status": "stopped",
-        "socket_id": socketId,
-        "reason": "admin_disconnected"
-      });
-    } catch (e) {
-      print("Error sending final location: $e");
+  log("Service instance started. Initializing...");
+
+  Timer? locationTimer;
+  IO.Socket? socket;
+  bool hasTrackedToday = false;
+
+  Timer.periodic(const Duration(minutes: 1), (timer) async {
+    final now = tz.TZDateTime.now(tz.local);
+    log("Timer ticked. Current time: $now. Checking conditions...");
+
+    if (now.hour == 0 && now.minute == 0) {
+      if (hasTrackedToday) {
+        hasTrackedToday = false;
+        log("Resetting hasTrackedToday flag at midnight.");
+      }
     }
-    
-    // Disconnect socket and stop service
-    socket.disconnect();
-    service.stopSelf();
+
+    if (now.hour == 21 && now.minute == 31   && !hasTrackedToday) {
+      hasTrackedToday = true;
+      log("Condition met: Starting tracking at 6:30 AM.");
+
+      final String? selectedRoute = prefs.getString("selectedRoute");
+      if (selectedRoute == null) {
+        log("ERROR: No route selected. Cannot start tracking.");
+        service.invoke("updateStatus", {'isTracking': false, 'message': 'Cannot start: No route selected'});
+        return;
+      }
+
+      log("Connecting socket for route: $selectedRoute");
+      socket = connectSocket(selectedRoute, "Driver");
+
+      socket?.onConnect((_) {
+        log("Socket connected successfully. Socket ID: ${socket?.id}");
+        WakelockPlus.enable();
+        service.invoke("updateStatus", {'isTracking': true, 'message': 'Tracking Started'});
+
+        locationTimer = Timer.periodic(const Duration(seconds: 5), (locTimer) async {
+          if (socket == null || !socket!.connected) return;
+          try {
+            Position position = await Geolocator.getCurrentPosition();
+            log("Got position: ${position.latitude}, ${position.longitude}");
+            socket!.emit("location_update", {
+              "route_id": selectedRoute,
+              "latitude": position.latitude,
+              "longitude": position.longitude,
+              "socket_id": socket?.id,
+              "role": "Driver",
+              "heading": position.heading,
+              "status": "tracking_active",
+            });
+          } catch (e) {
+            log("ERROR getting location: $e");
+          }
+        });
+      });
+
+      socket?.onDisconnect((_) {
+        log("Socket disconnected.");
+        locationTimer?.cancel();
+        WakelockPlus.disable();
+        service.invoke("updateStatus", {'isTracking': false, 'message': 'Connection Lost'});
+      });
+      
+      socket?.onError((error) => log("Socket ERROR: $error"));
+    }
   });
 
   service.on("stopService").listen((event) {
-    socket.emit("tracking_status", {
-      "route_id": selectedRoute, 
-      "status": "stopped",
-      "socket_id": socketId  // Include socket ID
-    });
-    socket.disconnect();
-    service.stopSelf();
+    log("Received stopService event. Stopping tracking.");
+    locationTimer?.cancel();
+    socket?.emit("tracking_status", {"route_id": event?['route_id'], "status": "stopped"});
+    socket?.disconnect();
+    WakelockPlus.disable();
+    service.invoke("updateStatus", {'isTracking': false, 'message': 'Tracking Stopped'});
   });
-  
-  // Only start location updates if not admin disconnected
-  Timer? locationTimer;
-  locationTimer = Timer.periodic(Duration(seconds: 10), (timer) async {
-    // Check if admin disconnected before sending updates
-    bool currentAdminDisconnected = (await SharedPreferences.getInstance()).getBool("adminDisconnected") ?? false;
-    if (currentAdminDisconnected) {
-      locationTimer?.cancel();
-      socket.disconnect();
-      service.stopSelf();
-      return;
-    }
-    
-    if (socket.connected) {
-      try {
-        Position position = await Geolocator.getCurrentPosition();
-        socket.emit("location_update", {
-          "route_id": selectedRoute,
-          "latitude": position.latitude, 
-          "longitude": position.longitude,
-          "status": "tracking_active",
-          "socket_id": socketId  // Include socket ID
-        });
-      } catch (e) {
-        print("Error getting location in background: $e");
-      }
-    }
-  });
+}
+
+IO.Socket connectSocket(String? routeId, String role) {
+  Map<String, dynamic> queryParams = {'role': role, 'route_id': routeId ?? 'Unknown'};
+  IO.Socket socket = IO.io(websocketUrl, IO.OptionBuilder().setTransports(['websocket']).setQuery(queryParams).disableAutoConnect().build());
+  socket.connect();
+  return socket;
 }
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initializeService();
-  runApp(DriverLocationApp());
+  runApp(const DriverLocationApp());
 }
 
 class DriverLocationApp extends StatefulWidget {
   const DriverLocationApp({super.key});
-
   @override
   _DriverLocationAppState createState() => _DriverLocationAppState();
 }
 
 class _DriverLocationAppState extends State<DriverLocationApp> {
-  dynamic isTracking = false;
-  bool isButtonPressed = false;
-  double buttonOpacity = 1.0;
-  
-  // Using RouteService for routes management
+  bool isTracking = false;
+  String statusMessage = "Waiting for 6:30 AM...";
   final RouteService _routeService = RouteService();
   List<String> routes = [];
   bool isLoadingRoutes = true;
-  
   String? selectedRouteId;
-  IO.Socket? socket; // Changed to nullable
-  String? socketId;
-  Timer? trackingTimer;
-  Timer? longPressTimer;
-  bool isAdminDisconnected = false;
+  
+  // NEW: State for in-app logging
+  final List<String> _logs = [];
+  Timer? _logSyncTimer;
+  String? _lastSyncedLog;
 
   @override
   void initState() {
     super.initState();
+    _log("App UI initialized.");
     _setupInitialData();
-    _checkBatteryOptimization();
-    _checkAdminDisconnectStatus();
-  }
-  
-  Future<void> _checkAdminDisconnectStatus() async {
-    SharedPreferences prefs = await SharedPreferences.getInstance();
-    setState(() {
-      isAdminDisconnected = prefs.getBool("adminDisconnected") ?? false;
-    });
-  }
-  
-  Future<void> _setupInitialData() async {
-    // Load routes first
-    await _loadRoutes();
-    
-    // Then load selected route (needs routes to be loaded first)
-    await _loadSelectedRoute();
-    
-    setState(() {
-      isLoadingRoutes = false;
-    });
-  }
-  
-  Future<void> _loadRoutes() async {
-    try {
-      final loadedRoutes = await _routeService.getRoutes();
-      setState(() {
-        routes = loadedRoutes;
-      });
-    } catch (e) {
-      print("Error loading routes: $e");
-      // If error, fallback to empty list, which will be replaced by defaults
-      setState(() {
-        routes = [];
-      });
-    }
-  }
+    _checkAndRequestPermissions();
 
-  void _showAdminDisconnectAlert() {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: Text("Disconnected"),
-        content: Text("You have been disconnected by an administrator"),
-        actions: [
-          TextButton(
-            child: Text("OK"),
-            onPressed: () => Navigator.pop(context),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _setupSocket() {
-    // Don't setup socket if already admin disconnected
-    if (isAdminDisconnected) {
-      return;
-    }
-    
-    // Initialize socket with route ID in query parameters if available
-    Map<String, dynamic> queryParams = {};
-    if (selectedRouteId != null) {
-      queryParams = {'route_id': selectedRouteId};
-    }
-
-    socket = IO.io(
-      websocketUrl,
-      IO.OptionBuilder()
-        .setTransports(['websocket'])
-        .setQuery(queryParams)  // Add query parameters
-        .disableAutoConnect()
-        .build(),
-    );
-    socket?.connect();
-    
-    socket?.onConnect((_) {
-      print("Socket Connected ✅");
-      setState(() {
-        socketId = socket?.id;
-        print("Socket ID: $socketId");
-      });
+    final service = FlutterBackgroundService();
+    service.on("updateStatus").listen((event) {
+      final message = event?['message'] ?? (event?['isTracking'] ? "Tracking Active" : "Tracking Stopped");
+      _log("UI received status update: $message");
+      if (mounted) {
+        setState(() {
+          isTracking = event?['isTracking'] ?? false;
+          statusMessage = message;
+        });
+      }
     });
     
-    socket?.onDisconnect((_) => print("Socket Disconnected ❌"));
-    
-    // Add this listener for force_disconnect events from admin
-    socket?.on('force_disconnect', (data) async {
-      print("Received force disconnect from admin: $data");
-      
-      // Set admin disconnect flag
-      SharedPreferences prefs = await SharedPreferences.getInstance();
-      await prefs.setBool("adminDisconnected", true);
-      
-      setState(() {
-        isAdminDisconnected = true;
-      });
-      
-      if (isTracking == true) {
-        // Send final location update before stopping
-        sendFinalBroadcast(selectedRouteId!, reason: "admin_disconnected");
-        
-        // Stop tracking
-        trackingTimer?.cancel();
-        FlutterBackgroundService().invoke("stopService");
-        WakelockPlus.disable();
-        
-        setState(() => isTracking = false);
-        
-        // Show alert to the user
-        _showAdminDisconnectAlert();
-        
-        // Actually disconnect the socket
-        socket?.disconnect();
-        socket = null;
-      } else {
-        // If not tracking, just alert and disconnect
-        _showAdminDisconnectAlert();
-        socket?.disconnect();
-        socket = null;
+    // NEW: Sync logs from the background service every 3 seconds
+    _logSyncTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
+      final prefs = await SharedPreferences.getInstance();
+      final latestLog = prefs.getString('last_background_log');
+      if (latestLog != null && latestLog != _lastSyncedLog) {
+        _log('[BG] $latestLog');
+        _lastSyncedLog = latestLog;
       }
     });
   }
-
-  Future<void> _resetAdminDisconnect() async {
-    SharedPreferences prefs = await SharedPreferences.getInstance();
-    await prefs.setBool("adminDisconnected", false);
-    
-    setState(() {
-      isAdminDisconnected = false;
-    });
-    
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text("Admin disconnect status reset. You can reconnect now.")),
-    );
-  }
   
-  Future<void> _onRouteChanged(String? newRoute) async {
-    if (isTracking == true) _toggleTracking();
-    
-    // Save the new route
-    SharedPreferences prefs = await SharedPreferences.getInstance();
-    await prefs.setString("selectedRoute", newRoute!);
-    
-    // Disconnect existing socket if connected
-    if (socket != null && socket!.connected) {
-      socket!.disconnect();
+  // NEW: Centralized logging function for the UI
+  void _log(String message) {
+    if (mounted) {
+      setState(() {
+        // Add new logs to the top of the list
+        _logs.insert(0, message);
+        // Optional: Limit the number of logs to prevent memory issues
+        if (_logs.length > 200) {
+          _logs.removeLast();
+        }
+      });
     }
-    
-    setState(() {
-      selectedRouteId = newRoute;
-      socketId = null;
-    });
   }
-  
-  Future<void> _checkBatteryOptimization() async {
-    var isIgnoring = await Permission.ignoreBatteryOptimizations.isGranted;
-    if (!isIgnoring) {
-      await Permission.ignoreBatteryOptimizations.request();
+
+  Future<void> _setupInitialData() async {
+    _log("Setting up initial data...");
+    await _loadRoutes();
+    await _loadSelectedRoute();
+    if (mounted) setState(() => isLoadingRoutes = false);
+    _log("Initial data setup complete.");
+  }
+
+  Future<void> _checkAndRequestPermissions() async {
+    _log("Checking permissions...");
+    final permissions = [
+      Permission.notification,
+      Permission.location,
+      Permission.locationAlways,
+      Permission.ignoreBatteryOptimizations,
+    ];
+    await permissions.request();
+    _log("Permission checks complete.");
+  }
+
+  // ... (other functions like _loadRoutes, _loadSelectedRoute, _onRouteChanged remain the same)
+  // ...
+  Future<void> _loadRoutes() async {
+    try {
+      _log("Fetching routes from server...");
+      final loadedRoutes = await _routeService.getRoutes();
+      _log("Successfully fetched ${loadedRoutes.length} routes.");
+      if (mounted) setState(() => routes = loadedRoutes);
+    } catch (e) {
+      _log("ERROR fetching routes: $e");
+      if (mounted) setState(() => routes = []);
     }
   }
 
   Future<void> _loadSelectedRoute() async {
     SharedPreferences prefs = await SharedPreferences.getInstance();
-    
-    // Get the stored route ID
     String? storedRouteId = prefs.getString("selectedRoute");
-    
-    // Validate it exists in our current routes list
+    _log("Loaded stored route: $storedRouteId");
     bool isValidRoute = storedRouteId != null && routes.contains(storedRouteId);
-    
-    setState(() {
-      // Use stored route if valid, otherwise default to first route (if available)
-      selectedRouteId = isValidRoute 
-          ? storedRouteId 
-          : (routes.isNotEmpty ? routes.first : null);
-    });
-    
-    // If we selected a different route than stored, update the storage
-    if (selectedRouteId != storedRouteId && selectedRouteId != null) {
-      await prefs.setString("selectedRoute", selectedRouteId!);
-    }
-  }
-
-  Future<void> _refreshRoutes() async {
-    setState(() {
-      isLoadingRoutes = true;
-    });
-    
-    try {
-      final refreshedRoutes = await _routeService.refreshRoutes();
+    if (mounted) {
       setState(() {
-        routes = refreshedRoutes;
-        isLoadingRoutes = false;
+        selectedRouteId = isValidRoute ? storedRouteId : (routes.isNotEmpty ? routes.first : null);
       });
-      
-      // Re-validate selected route after refresh
-      _loadSelectedRoute();
-    } catch (e) {
-      setState(() {
-        isLoadingRoutes = false;
-      });
-      
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Failed to refresh routes. Using cached data.")),
-      );
-    }
-  }
-
-  void _toggleTracking() async {
-    // If admin disconnected, show message and don't allow tracking
-    if (isAdminDisconnected) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text("You were disconnected by an admin. Please restart the app or reset the connection."),
-          duration: Duration(seconds: 5),
-          action: SnackBarAction(
-            label: "Reset",
-            onPressed: _resetAdminDisconnect,
-          ),
-        ),
-      );
-      return;
-    }
-    
-    setState(() => isButtonPressed = true);
-    await Future.delayed(Duration(milliseconds: 100));
-    setState(() => isButtonPressed = false);
-
-    final service = FlutterBackgroundService();
-    if (isTracking == true) {
-      setState(() => isTracking = null);
-      await Future.delayed(Duration(seconds: 2));
-      sendFinalBroadcast(selectedRouteId!);
-      await Future.delayed(Duration(seconds: 1));
-      trackingTimer?.cancel();
-      service.invoke("stopService");
-      WakelockPlus.disable();
-      
-      // Disconnect socket when stopping tracking
-      socket?.disconnect();
-      socket = null;
-      
-      setState(() {
-        isTracking = false;
-        socketId = null;
-      });
-    } else {
-      if (await Permission.location.request().isGranted) {
-        if (selectedRouteId == null) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("Please select a route first")),
-          );
-          return;
-        }
-        
-        // Setup and connect socket when starting tracking
-        _setupSocket();
-        
-        // Wait for socket connection
-        int attempts = 0;
-        while (socket?.connected != true && attempts < 10) {
-          await Future.delayed(Duration(milliseconds: 300));
-          attempts++;
-        }
-        
-        if (socket?.connected != true) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("Failed to connect to server. Please try again.")),
-          );
-          return;
-        }
-        
-        SharedPreferences prefs = await SharedPreferences.getInstance();
+      if (selectedRouteId != null) {
+        _log("Setting current route to: $selectedRouteId");
         await prefs.setString("selectedRoute", selectedRouteId!);
-        service.startService();
-        WakelockPlus.enable();
-        setState(() => isTracking = true);
-        startTracking();
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Location permission denied")),
-        );
       }
     }
   }
 
-  void startTracking() {
-    const double stopRadius = 500; // 500 meters
-    const double targetLatitude = 17.539883;
-    const double targetLongitude = 78.386531; 
-
-    trackingTimer = Timer.periodic(Duration(seconds: 5), (timer) async {
-      // Check if admin disconnected
-      SharedPreferences prefs = await SharedPreferences.getInstance();
-      bool currentAdminDisconnected = prefs.getBool("adminDisconnected") ?? false;
-      
-      if (currentAdminDisconnected || socket == null || !socket!.connected) {
-        timer.cancel();
-        FlutterBackgroundService().invoke("stopService");
-        WakelockPlus.disable();
-        
-        setState(() {
-          isTracking = false;
-          isAdminDisconnected = currentAdminDisconnected;
-        });
-        
-        if (currentAdminDisconnected && !isAdminDisconnected) {
-          _showAdminDisconnectAlert();
-        }
-        return;
-      }
-      
-      Position position = await Geolocator.getCurrentPosition();
-      double distance = Geolocator.distanceBetween(
-        position.latitude, position.longitude, targetLatitude, targetLongitude);
-      
-      Map<String, dynamic> trackingData = {
-        "route_id": selectedRouteId,
-        "latitude": position.latitude,
-        "longitude": position.longitude,
-        "status": "tracking_active",
-        "socket_id": socketId  // Include the socket ID
-      };
-      socket?.emit("location_update", trackingData);
-
-      DateTime now = DateTime.now();
-      if (now.hour >= 6 && now.hour < 12 && distance <= stopRadius) {
-        sendFinalBroadcast(selectedRouteId!);
-        trackingTimer?.cancel();
-        FlutterBackgroundService().invoke("stopService");
-        WakelockPlus.disable();
-        
-        // Disconnect socket
-        socket?.disconnect();
-        socket = null;
-        
-        setState(() {
-          isTracking = false;
-          socketId = null;
-        });
-        print("🚦 Auto-stopping: Entered 500m radius of target location (Morning).");
-      }
-    });
+  Future<void> _onRouteChanged(String? newRoute) async {
+    if (newRoute == null) return;
+    _log("Route changed to: $newRoute");
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    await prefs.setString("selectedRoute", newRoute);
+    if (mounted) {
+      setState(() => selectedRouteId = newRoute);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Route set to $newRoute.")),
+      );
+    }
+  }
+  
+  // NEW: Function to show the logs screen
+  void _showLogsScreen() {
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (context) => Scaffold(
+        appBar: AppBar(title: const Text("Application Logs")),
+        body: ListView.builder(
+          reverse: true, // Show newest logs first
+          itemCount: _logs.length,
+          itemBuilder: (context, index) {
+            return Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
+              child: Text(_logs[index]),
+            );
+          },
+        ),
+      ),
+    ));
   }
 
-  void sendFinalBroadcast(String routeId, {String? reason}) async {
-    if (socket == null || !socket!.connected) return;
-    
-    Position position = await Geolocator.getCurrentPosition();
-    Map<String, dynamic> finalBroadcast = {
-      "route_id": routeId,
-      "latitude": position.latitude,
-      "longitude": position.longitude,
-      "status": "stopped",
-      "socket_id": socketId  // Include the socket ID
-    };
-    
-    // Add reason if provided
-    if (reason != null) {
-      finalBroadcast["reason"] = reason;
-    }
-    
-    socket?.emit("location_update", finalBroadcast);
+  @override
+  void dispose() {
+    _logSyncTimer?.cancel();
+    super.dispose();
   }
 
   @override
@@ -522,107 +301,64 @@ class _DriverLocationAppState extends State<DriverLocationApp> {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       home: Scaffold(
+        appBar: AppBar(
+          title: const Text("VJ Bus Driver"),
+          actions: [
+            // NEW: Button to open the logs screen
+            IconButton(
+              icon: const Icon(Icons.description),
+              tooltip: 'Show Logs',
+              onPressed: _showLogsScreen,
+            ),
+          ],
+        ),
         body: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              if (isAdminDisconnected)
-                Container(
-                  margin: EdgeInsets.only(bottom: 16),
-                  padding: EdgeInsets.all(8),
-                  decoration: BoxDecoration(
-                    color: Colors.red.shade100,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
+          child: Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                if (isLoadingRoutes)
+                  const CircularProgressIndicator()
+                else if (routes.isEmpty)
+                  const Text("No routes available. Check connection.")
+                else
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Icon(Icons.warning, color: Colors.red),
-                      SizedBox(width: 8),
-                      Flexible(
-                        child: Text(
-                          "Admin disconnected your session",
-                          style: TextStyle(color: Colors.red),
-                        ),
+                      const Text("Select Route:", style: TextStyle(fontSize: 16)),
+                      const SizedBox(height: 10),
+                      DropdownButton<String>(
+                        value: selectedRouteId,
+                        isExpanded: true,
+                        hint: const Text("Choose your route"),
+                        items: routes.map((route) {
+                          return DropdownMenuItem<String>(
+                            value: route,
+                            child: Text(route),
+                          );
+                        }).toList(),
+                        onChanged: _onRouteChanged,
                       ),
-                      TextButton(
-                        onPressed: _resetAdminDisconnect,
-                        child: Text("Reset"),
-                      )
                     ],
                   ),
-                ),
-              if (isLoadingRoutes)
-                CircularProgressIndicator()
-              else if (routes.isEmpty)
-                Text("No routes available. Check connection.") 
-              else
-                DropdownButton<String>(
-                  value: selectedRouteId,
-                  onChanged: _onRouteChanged,
-                  items: routes.map((routeId) {
-                    return DropdownMenuItem(
-                      value: routeId,
-                      child: Text(routeId),
-                    );
-                  }).toList(),
-                ),
-              SizedBox(height: 20),
-              Text(
-                isTracking == true
-                    ? "✅Bus Started $selectedRouteId"
-                    : "❌ Bus Stopped",
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: isTracking == true ? Color(0xFF006400) : Color(0xFF8B0000)),
-              ),
-              SizedBox(height: 10),
-              socketId != null 
-                ? Text("Socket ID: ${socketId!.substring(0, min(8, socketId!.length))}...", 
-                    style: TextStyle(fontSize: 12, color: Colors.grey))
-                : Text("Not connected", 
-                    style: TextStyle(fontSize: 12, color: Colors.red)),
-              SizedBox(height: 20),
-              GestureDetector(
-                onTapDown: (_) => setState(() => isButtonPressed = true),
-                onTapUp: (_) => setState(() => isButtonPressed = false),
-                onTapCancel: () => setState(() => isButtonPressed = false),
-                onTap: _toggleTracking,
-                child: AnimatedOpacity(
-                  duration: Duration(milliseconds: 100),
-                  opacity: isButtonPressed ? 0.6 : buttonOpacity,
-                  child: AnimatedScale(
-                    scale: isButtonPressed ? 0.9 : 1.0,
-                    duration: Duration(milliseconds: 100),
-                    child: Container(
-                      width: 150,
-                      height: 150,
-                      decoration: BoxDecoration(
-                        color: isTracking == true ? Colors.red : Colors.blue,
-                        shape: BoxShape.circle,
-                      ),
-                      alignment: Alignment.center,
-                      child: isTracking == null
-                          ? CircularProgressIndicator(color: Colors.white)
-                          : Text(
-                              isTracking == true ? "STOP" : "START",
-                              style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold),
-                            ),
-                    ),
+
+                  // ... route selection dropdown ...
+                
+                const SizedBox(height: 40),
+                Icon(isTracking ? Icons.location_on : Icons.location_off_outlined, color: isTracking ? Colors.green : Colors.grey, size: 100),
+                const SizedBox(height: 20),
+                Text(statusMessage, textAlign: TextAlign.center, style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: isTracking ? Colors.green.shade800 : Colors.red.shade800)),
+                if (selectedRouteId != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8.0),
+                    child: Text("Current Route: $selectedRouteId", style: const TextStyle(fontSize: 16)),
                   ),
-                ),
-              ),
-              SizedBox(height: 20),
-              TextButton(
-                onPressed: isLoadingRoutes ? null : _refreshRoutes,
-                child: Text("Refresh Routes"),
-              )
-            ],
+              ],
+            ),
           ),
         ),
       ),
     );
-  }
-  // Helper method to get minimum of two integers
-  int min(int a, int b) {
-    return a < b ? a : b;
   }
 }

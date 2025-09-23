@@ -3,7 +3,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 class RouteService {
-  static const String ROUTES_API_URL = "https://bus.vnrzone.site/get-all-routes";
+  static const String ROUTES_API_URL = "https://bus.vjstartup.com/get-all-routes";
   static const String CACHE_KEY = "cached_routes";
   static const String LAST_FETCH_KEY = "last_routes_fetch";
 
